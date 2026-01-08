@@ -54,6 +54,9 @@ const EFFECT_NAMES = {
  * 初始化节日效果
  */
 export async function initFestivalEffects() {
+    // 直接返回，禁用所有节日特效
+    return;
+
     try {
         const config = await fetchFestivalConfig();
 
