@@ -171,6 +171,15 @@ type ClaudeStreamEvent struct {
 	} `json:"usage,omitempty"`
 }
 
+// ToolCallState tracks the state of a single tool call in a streaming response
+type ToolCallState struct {
+	ID           string // Tool call ID
+	Name         string // Tool/function name
+	Arguments    string // Accumulated arguments JSON
+	ClaudeIndex  int    // Index in Claude's content blocks
+	BlockStarted bool   // Whether content_block_start has been sent
+}
+
 // StreamContext holds the state for a single streaming response
 // This allows multiple concurrent streams to be processed independently
 type StreamContext struct {
@@ -198,6 +207,8 @@ type StreamContext struct {
 	CurrentToolID   string // Current tool call ID being processed
 	CurrentToolName string // Current tool call name being processed
 	ToolArguments   string // Accumulated tool arguments
+	// Multi-tool call tracking (OpenAI index -> ToolCallState)
+	ToolCallStates map[int]*ToolCallState
 }
 
 // NewStreamContext creates a new stream context with default values
@@ -222,6 +233,7 @@ func NewStreamContext() *StreamContext {
 		ToolCallBuffer:       "",
 		ToolCallIDMap:        make(map[string]string),
 		ToolCallCounter:      0,
+		ToolCallStates:       make(map[int]*ToolCallState),
 	}
 }
 
