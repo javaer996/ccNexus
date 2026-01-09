@@ -428,6 +428,8 @@ func OpenAIStreamToClaude(event []byte, ctx *transformer.StreamContext) ([]byte,
 	if jsonData == "" || jsonData == "[DONE]" {
 		if jsonData == "[DONE]" {
 			var result []byte
+			// Track if we ever had any content before closing blocks
+			hadContent := ctx.ContentBlockStarted || ctx.ThinkingBlockStarted || ctx.ToolBlockStarted || len(ctx.ToolCallStates) > 0
 			// Close any open content blocks before message_stop
 			if ctx.ThinkingBlockStarted {
 				result = append(result, buildClaudeEvent("content_block_stop", map[string]interface{}{"index": ctx.ThinkingIndex})...)
@@ -437,17 +439,55 @@ func OpenAIStreamToClaude(event []byte, ctx *transformer.StreamContext) ([]byte,
 				result = append(result, buildClaudeEvent("content_block_stop", map[string]interface{}{"index": ctx.ContentIndex})...)
 				ctx.ContentBlockStarted = false
 			}
+			// Close all open tool call blocks (using ToolCallStates for multi-tool support)
 			if ctx.ToolBlockStarted {
+				// Legacy single-tool mode
 				result = append(result, buildClaudeEvent("content_block_stop", map[string]interface{}{"index": ctx.ToolIndex})...)
 				ctx.ToolBlockStarted = false
 			}
+			// Also close any tool blocks in ToolCallStates (multi-tool mode)
+			for _, state := range ctx.ToolCallStates {
+				if state != nil && state.BlockStarted {
+					result = append(result, buildClaudeEvent("content_block_stop", map[string]interface{}{"index": state.ClaudeIndex})...)
+					state.BlockStarted = false
+				}
+			}
+
+			// If no content was ever produced (empty response), trigger TodoRead tool call
+			if !hadContent {
+				toolID := "toolu_todoread_" + ctx.MessageID
+				claudeIndex := ctx.ContentIndex
+				ctx.ContentIndex++
+
+				// Create and store the tool call state
+				ctx.ToolCallStates[0] = &transformer.ToolCallState{
+					ID:           toolID,
+					Name:         "TodoRead",
+					Arguments:    "{}",
+					ClaudeIndex:  claudeIndex,
+					BlockStarted: true,
+				}
+
+				// Send content_block_start for TodoRead tool call
+				result = append(result, buildClaudeEvent("content_block_start", map[string]interface{}{
+					"index":         claudeIndex,
+					"content_block": map[string]interface{}{"type": "tool_use", "id": toolID, "name": "TodoRead", "input": map[string]interface{}{}},
+				})...)
+				result = append(result, buildClaudeEvent("content_block_stop", map[string]interface{}{"index": claudeIndex})...)
+			}
+
 			// Send message_delta with stop_reason if not sent
+			// Use "tool_use" only if we triggered TodoRead (not if there were original tool calls)
+			stopReason := "end_turn"
+			if !hadContent && len(ctx.ToolCallStates) > 0 {
+				stopReason = "tool_use"
+			}
 			if !ctx.FinishReasonSent {
 				result = append(result, buildClaudeEvent("message_delta", map[string]interface{}{
-					"delta": map[string]interface{}{"stop_reason": "end_turn", "stop_sequence": nil},
-					"usage": map[string]interface{}{"output_tokens": 0},
-				})...)
-			}
+				"delta": map[string]interface{}{"stop_reason": stopReason, "stop_sequence": nil},
+				"usage":  map[string]interface{}{"output_tokens": 0},
+			})...)
+		}
 			result = append(result, buildClaudeEvent("message_stop", map[string]interface{}{})...)
 			return result, nil
 		}
@@ -537,6 +577,15 @@ func OpenAIStreamToClaude(event []byte, ctx *transformer.StreamContext) ([]byte,
 				ctx.ContentIndex++
 			}
 
+			// If previous tool blocks are still open (no finish_reason yet), close them before starting a new tool block.
+			// Claude clients (incl. Claude Code) expect content_block index sequence to be linear and blocks not to overlap.
+			for _, state := range ctx.ToolCallStates {
+				if state != nil && state.BlockStarted {
+					result = append(result, buildClaudeEvent("content_block_stop", map[string]interface{}{"index": state.ClaudeIndex})...)
+					state.BlockStarted = false
+				}
+			}
+
 			// Assign a new Claude content block index for this tool call
 			claudeIndex := ctx.ContentIndex
 			ctx.ContentIndex++
@@ -571,14 +620,41 @@ func OpenAIStreamToClaude(event []byte, ctx *transformer.StreamContext) ([]byte,
 
 	// Finish
 	if choice.FinishReason != nil {
+		// Track if we ever had any content before closing blocks
+		hadContent := ctx.ContentBlockStarted || ctx.ThinkingBlockStarted || ctx.ToolBlockStarted || len(ctx.ToolCallStates) > 0
+		// Close thinking block if open
 		if ctx.ThinkingBlockStarted {
 			result = append(result, buildClaudeEvent("content_block_stop", map[string]interface{}{"index": ctx.ThinkingIndex})...)
 			ctx.ThinkingBlockStarted = false
 		}
-		if ctx.ContentBlockStarted {
+
+		// If no content was ever produced (empty response), trigger TodoRead tool call
+		if !hadContent {
+			toolID := "toolu_todoread_" + ctx.MessageID
+			claudeIndex := ctx.ContentIndex
+			ctx.ContentIndex++
+
+			// Create and store the tool call state
+			ctx.ToolCallStates[0] = &transformer.ToolCallState{
+				ID:           toolID,
+				Name:         "TodoRead",
+				Arguments:    "{}",
+				ClaudeIndex:  claudeIndex,
+				BlockStarted: true,
+			}
+
+			// Send content_block_start for TodoRead tool call
+			result = append(result, buildClaudeEvent("content_block_start", map[string]interface{}{
+				"index":         claudeIndex,
+				"content_block": map[string]interface{}{"type": "tool_use", "id": toolID, "name": "TodoRead", "input": map[string]interface{}{}},
+			})...)
+			result = append(result, buildClaudeEvent("content_block_stop", map[string]interface{}{"index": claudeIndex})...)
+		} else if ctx.ContentBlockStarted {
+			// Close content block if it was started
 			result = append(result, buildClaudeEvent("content_block_stop", map[string]interface{}{"index": ctx.ContentIndex})...)
 			ctx.ContentBlockStarted = false
 		}
+
 		// Close all open tool call blocks
 		for _, state := range ctx.ToolCallStates {
 			if state.BlockStarted {
@@ -587,7 +663,8 @@ func OpenAIStreamToClaude(event []byte, ctx *transformer.StreamContext) ([]byte,
 			}
 		}
 		stopReason := "end_turn"
-		if *choice.FinishReason == "tool_calls" {
+		// Use "tool_use" if original response had tool calls, or if we triggered TodoRead
+		if *choice.FinishReason == "tool_calls" || (!hadContent && len(ctx.ToolCallStates) > 0) {
 			stopReason = "tool_use"
 		}
 		result = append(result, buildClaudeEvent("message_delta", map[string]interface{}{
